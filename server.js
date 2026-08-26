@@ -16,8 +16,14 @@
  *   - session cookies are HttpOnly + Secure + SameSite, never in localStorage
  *   - JWTs are short-lived and verified server-side on every protected call
  *
- * Storage is in-memory (Maps) for assignment/demo purposes.
- * Swap `db.js`-style module for a real DB in production.
+ * STORAGE:
+ *   Vercel's serverless functions do NOT share memory between invocations —
+ *   a plain in-memory Map can silently reset between requests in production.
+ *   So storage here is an abstraction (`store`) that uses Vercel KV (a
+ *   persistent, Redis-compatible store) whenever KV env vars are present,
+ *   and transparently falls back to in-memory Maps otherwise (e.g. running
+ *   `npm start` locally without any KV setup). See README for how to attach
+ *   a KV store to your Vercel project — it's a few clicks, no code changes.
  */
 
 const express = require("express");
@@ -37,12 +43,74 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
 
 // ---------------------------------------------------------------------------
-// In-memory "database"
+// Storage layer — Vercel KV when configured, in-memory fallback otherwise
 // ---------------------------------------------------------------------------
-const users = new Map(); // userId -> user object
-const usersByEmail = new Map(); // email(lowercase) -> userId
-const challenges = new Map(); // challengeId -> challenge object
-const sessions = new Map(); // sessionId -> session object
+const useKv = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+let kv = null;
+if (useKv) {
+  // Vercel's KV product is deprecated in favor of the "Upstash for Redis" Marketplace
+  // integration, but it injects the SAME env var names (KV_REST_API_URL / KV_REST_API_TOKEN),
+  // so we talk to it directly with @upstash/redis for a supported, non-deprecated client.
+  const { Redis } = require("@upstash/redis");
+  kv = new Redis({
+    url: process.env.KV_REST_API_URL,
+    token: process.env.KV_REST_API_TOKEN,
+  });
+  console.log("[storage] Using Upstash Redis (persistent across requests).");
+} else {
+  console.log("[storage] KV env vars not found — using in-memory storage (fine for local dev; " +
+    "will NOT persist across serverless invocations if deployed to Vercel like this).");
+}
+
+const memUsers = new Map(); // userId -> user object
+const memUsersByEmail = new Map(); // email(lowercase) -> userId
+const memChallenges = new Map(); // challengeId -> challenge object
+const memSessions = new Map(); // sessionId -> session object
+
+const store = {
+  async getUser(userId) {
+    if (!userId) return null;
+    if (useKv) return (await kv.get(`user:${userId}`)) || null;
+    return memUsers.get(userId) || null;
+  },
+  async setUser(user) {
+    if (useKv) await kv.set(`user:${user.id}`, user);
+    else memUsers.set(user.id, user);
+  },
+  async getUserIdByEmail(email) {
+    if (useKv) return (await kv.get(`useremail:${email}`)) || null;
+    return memUsersByEmail.get(email) || null;
+  },
+  async setUserIdByEmail(email, userId) {
+    if (useKv) await kv.set(`useremail:${email}`, userId);
+    else memUsersByEmail.set(email, userId);
+  },
+  async getChallenge(challengeId) {
+    if (!challengeId) return null;
+    if (useKv) return (await kv.get(`challenge:${challengeId}`)) || null;
+    return memChallenges.get(challengeId) || null;
+  },
+  async setChallenge(challenge) {
+    // Keep it around a bit past expiry so "this code has expired" can still be shown.
+    const ttlSeconds = Math.max(60, Math.ceil((challenge.expiresAt - Date.now()) / 1000) + 300);
+    if (useKv) await kv.set(`challenge:${challenge.challengeId}`, challenge, { ex: ttlSeconds });
+    else memChallenges.set(challenge.challengeId, challenge);
+  },
+  async getSession(sessionId) {
+    if (!sessionId) return null;
+    if (useKv) return (await kv.get(`session:${sessionId}`)) || null;
+    return memSessions.get(sessionId) || null;
+  },
+  async setSession(session) {
+    const ttlSeconds = Math.max(60, Math.ceil((session.expiresAt - Date.now()) / 1000));
+    if (useKv) await kv.set(`session:${session.sessionId}`, session, { ex: ttlSeconds });
+    else memSessions.set(session.sessionId, session);
+  },
+  async deleteSession(sessionId) {
+    if (useKv) await kv.del(`session:${sessionId}`);
+    else memSessions.delete(sessionId);
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -71,7 +139,6 @@ function newId(prefix) {
 }
 
 function generateOtp() {
-  // 6-digit numeric OTP, zero-padded
   return crypto.randomInt(0, 10 ** OTP_LENGTH).toString().padStart(OTP_LENGTH, "0");
 }
 
@@ -79,7 +146,7 @@ function hashOtp(otp) {
   return crypto.createHash("sha256").update(otp).digest("hex");
 }
 
-function createChallenge({ userId, channel, destination }) {
+async function createChallenge({ userId, channel, destination }) {
   const otp = generateOtp();
   const challengeId = newId("chal");
   const now = Date.now();
@@ -88,7 +155,7 @@ function createChallenge({ userId, channel, destination }) {
     challengeId,
     userId,
     channel, // 'email' | 'sms'
-    destination, // masked-safe display value (email or phone)
+    destination,
     otpHash: hashOtp(otp),
     createdAt: now,
     expiresAt: now + OTP_EXPIRY_SECONDS * 1000,
@@ -99,9 +166,8 @@ function createChallenge({ userId, channel, destination }) {
     locked: false,
   };
 
-  challenges.set(challengeId, challenge);
+  await store.setChallenge(challenge);
 
-  // Simulated delivery — this is where a real email/SMS provider would be called.
   console.log(
     `\n[SIMULATED ${channel.toUpperCase()}]\nTo: ${destination}\nOTP: ${otp}\n(expires in ${OTP_EXPIRY_SECONDS}s, challengeId=${challengeId})\n`
   );
@@ -109,7 +175,7 @@ function createChallenge({ userId, channel, destination }) {
   return { challenge, otp };
 }
 
-function regenerateOtp(challenge) {
+async function regenerateOtp(challenge) {
   const otp = generateOtp();
   const now = Date.now();
   challenge.otpHash = hashOtp(otp);
@@ -119,6 +185,8 @@ function regenerateOtp(challenge) {
   challenge.attempts = 0;
   challenge.verified = false;
   challenge.locked = false;
+
+  await store.setChallenge(challenge);
 
   console.log(
     `\n[SIMULATED ${challenge.channel.toUpperCase()} - RESEND]\nTo: ${challenge.destination}\nOTP: ${otp}\n(expires in ${OTP_EXPIRY_SECONDS}s, challengeId=${challenge.challengeId})\n`
@@ -181,7 +249,7 @@ function isValidMobile(mobile) {
 // ---------------------------------------------------------------------------
 // POST /api/register — Step 1: create the (pending) account, send email OTP
 // ---------------------------------------------------------------------------
-app.post("/api/register", (req, res) => {
+app.post("/api/register", async (req, res) => {
   const { fullName, email, mobile, password, agreeToTerms } = req.body || {};
 
   const errors = {};
@@ -197,7 +265,8 @@ app.post("/api/register", (req, res) => {
   }
 
   const normalizedEmail = email.trim().toLowerCase();
-  if (usersByEmail.has(normalizedEmail)) {
+  const existingUserId = await store.getUserIdByEmail(normalizedEmail);
+  if (existingUserId) {
     return res.status(409).json({
       success: false,
       errors: { email: "An account with this email already exists" },
@@ -219,13 +288,15 @@ app.post("/api/register", (req, res) => {
     mfaMethod: null,
     mfaSecret: null,
     registrationComplete: false,
+    failedLoginAttempts: 0,
+    lockUntil: null,
     createdAt: Date.now(),
   };
 
-  users.set(userId, user);
-  usersByEmail.set(normalizedEmail, userId);
+  await store.setUser(user);
+  await store.setUserIdByEmail(normalizedEmail, userId);
 
-  const { challenge } = createChallenge({
+  const { challenge } = await createChallenge({
     userId,
     channel: "email",
     destination: user.email,
@@ -239,11 +310,11 @@ app.post("/api/register", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Generic OTP verify handler (shared by email + sms)
+// Generic OTP verify handler (shared by email + sms + login MFA)
 // ---------------------------------------------------------------------------
-function verifyOtpChallenge(req, res, expectedChannel, onSuccess) {
+async function verifyOtpChallenge(req, res, expectedChannel, onSuccess) {
   const { challengeId, otp } = req.body || {};
-  const challenge = challenges.get(challengeId);
+  const challenge = await store.getChallenge(challengeId);
 
   if (!challenge || challenge.channel !== expectedChannel) {
     return res.status(404).json({ success: false, error: "Invalid or expired verification request." });
@@ -271,6 +342,7 @@ function verifyOtpChallenge(req, res, expectedChannel, onSuccess) {
     if (challenge.attempts >= challenge.maxAttempts) {
       challenge.locked = true;
     }
+    await store.setChallenge(challenge);
     return res.status(400).json({
       success: false,
       error: challenge.locked
@@ -283,20 +355,21 @@ function verifyOtpChallenge(req, res, expectedChannel, onSuccess) {
   // Correct + single-use: invalidate immediately
   challenge.verified = true;
   challenge.locked = true; // prevents replay of the same code
+  await store.setChallenge(challenge);
 
-  const user = users.get(challenge.userId);
+  const user = await store.getUser(challenge.userId);
   return onSuccess(user, challenge, res);
 }
 
 // ---------------------------------------------------------------------------
 // POST /api/verify-email-otp — Step 2
 // ---------------------------------------------------------------------------
-app.post("/api/verify-email-otp", (req, res) => {
-  verifyOtpChallenge(req, res, "email", (user, challenge, res) => {
+app.post("/api/verify-email-otp", async (req, res) => {
+  await verifyOtpChallenge(req, res, "email", async (user, challenge, res) => {
     user.emailVerified = true;
+    await store.setUser(user);
 
-    // Automatically kick off SMS OTP, per the flow: Email OTP -> SMS OTP
-    const { challenge: smsChallenge } = createChallenge({
+    const { challenge: smsChallenge } = await createChallenge({
       userId: user.id,
       channel: "sms",
       destination: user.mobile,
@@ -314,9 +387,9 @@ app.post("/api/verify-email-otp", (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/send-email-otp — (re)send / start an email OTP challenge
 // ---------------------------------------------------------------------------
-app.post("/api/send-email-otp", (req, res) => {
+app.post("/api/send-email-otp", async (req, res) => {
   const { challengeId } = req.body || {};
-  const challenge = challenges.get(challengeId);
+  const challenge = await store.getChallenge(challengeId);
 
   if (!challenge || challenge.channel !== "email") {
     return res.status(404).json({ success: false, error: "Verification request not found." });
@@ -329,18 +402,17 @@ app.post("/api/send-email-otp", (req, res) => {
     });
   }
 
-  regenerateOtp(challenge);
+  await regenerateOtp(challenge);
   return res.json({ success: true, challenge: publicChallengeView(challenge) });
 });
 
 // ---------------------------------------------------------------------------
 // POST /api/send-sms-otp — (re)send / start an SMS OTP challenge
 // ---------------------------------------------------------------------------
-app.post("/api/send-sms-otp", (req, res) => {
+app.post("/api/send-sms-otp", async (req, res) => {
   const { challengeId, userId } = req.body || {};
 
-  // Allow resend via existing challengeId, or a fresh start via userId
-  let challenge = challengeId ? challenges.get(challengeId) : null;
+  let challenge = challengeId ? await store.getChallenge(challengeId) : null;
 
   if (challenge && challenge.channel === "sms") {
     if (Date.now() < challenge.resendAvailableAt) {
@@ -350,11 +422,11 @@ app.post("/api/send-sms-otp", (req, res) => {
         challenge: publicChallengeView(challenge),
       });
     }
-    regenerateOtp(challenge);
+    await regenerateOtp(challenge);
     return res.json({ success: true, challenge: publicChallengeView(challenge) });
   }
 
-  const user = users.get(userId);
+  const user = await store.getUser(userId);
   if (!user) {
     return res.status(404).json({ success: false, error: "User not found." });
   }
@@ -362,7 +434,7 @@ app.post("/api/send-sms-otp", (req, res) => {
     return res.status(400).json({ success: false, error: "Verify your email before requesting SMS OTP." });
   }
 
-  const { challenge: newChallenge } = createChallenge({
+  const { challenge: newChallenge } = await createChallenge({
     userId: user.id,
     channel: "sms",
     destination: user.mobile,
@@ -374,9 +446,10 @@ app.post("/api/send-sms-otp", (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/verify-sms-otp — Step 3
 // ---------------------------------------------------------------------------
-app.post("/api/verify-sms-otp", (req, res) => {
-  verifyOtpChallenge(req, res, "sms", (user, challenge, res) => {
+app.post("/api/verify-sms-otp", async (req, res) => {
+  await verifyOtpChallenge(req, res, "sms", async (user, challenge, res) => {
     user.mobileVerified = true;
+    await store.setUser(user);
     return res.json({
       success: true,
       user: publicUserView(user),
@@ -387,11 +460,10 @@ app.post("/api/verify-sms-otp", (req, res) => {
 
 // ---------------------------------------------------------------------------
 // POST /api/mfa/setup — Step 4/5: choose MFA method
-//   method: 'authenticator' | 'sms' | 'email'
 // ---------------------------------------------------------------------------
 app.post("/api/mfa/setup", async (req, res) => {
   const { userId, method } = req.body || {};
-  const user = users.get(userId);
+  const user = await store.getUser(userId);
 
   if (!user) return res.status(404).json({ success: false, error: "User not found." });
   if (!user.emailVerified || !user.mobileVerified) {
@@ -409,6 +481,7 @@ app.post("/api/mfa/setup", async (req, res) => {
       length: 20,
     });
     user.mfaSecret = secret.base32;
+    await store.setUser(user);
 
     const qrDataUrl = await QRCode.toDataURL(secret.otpauth_url);
 
@@ -421,9 +494,9 @@ app.post("/api/mfa/setup", async (req, res) => {
     });
   }
 
-  // SMS or Email MFA: just send a fresh OTP over that channel
+  await store.setUser(user);
   const destination = method === "sms" ? user.mobile : user.email;
-  const { challenge } = createChallenge({ userId: user.id, channel: method === "sms" ? "sms" : "email", destination });
+  const { challenge } = await createChallenge({ userId: user.id, channel: method, destination });
 
   return res.json({
     success: true,
@@ -436,15 +509,16 @@ app.post("/api/mfa/setup", async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/mfa/verify — Step 6: verify TOTP code or OTP, complete registration
 // ---------------------------------------------------------------------------
-app.post("/api/mfa/verify", (req, res) => {
+app.post("/api/mfa/verify", async (req, res) => {
   const { userId, code, challengeId } = req.body || {};
-  const user = users.get(userId);
+  const user = await store.getUser(userId);
 
   if (!user) return res.status(404).json({ success: false, error: "User not found." });
 
-  const finalize = () => {
+  const finalize = async () => {
     user.mfaEnabled = true;
     user.registrationComplete = true;
+    await store.setUser(user);
     return res.json({ success: true, user: publicUserView(user), nextStep: "success" });
   };
 
@@ -456,7 +530,7 @@ app.post("/api/mfa/verify", (req, res) => {
       secret: user.mfaSecret,
       encoding: "base32",
       token: (code || "").trim(),
-      window: 1, // allow ~30s clock drift
+      window: 1,
     });
 
     if (!verified) {
@@ -465,7 +539,6 @@ app.post("/api/mfa/verify", (req, res) => {
     return finalize();
   }
 
-  // sms / email MFA path reuses the OTP challenge machinery
   return verifyOtpChallenge(
     { body: { challengeId, otp: code } },
     res,
@@ -481,44 +554,45 @@ app.post("/api/mfa/verify", (req, res) => {
 // ---------------------------------------------------------------------------
 // Session helpers
 // ---------------------------------------------------------------------------
-function createSession(userId, rememberMe) {
+async function createSession(userId, rememberMe) {
   const sessionId = newId("sess");
   const now = Date.now();
   const ttl = rememberMe ? SESSION_TTL_REMEMBER_MS : SESSION_TTL_MS;
-  sessions.set(sessionId, { sessionId, userId, createdAt: now, expiresAt: now + ttl });
+  const session = { sessionId, userId, createdAt: now, expiresAt: now + ttl };
+  await store.setSession(session);
   return { sessionId, ttl };
 }
 
 function setSessionCookie(res, sessionId, ttl) {
   res.cookie(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
-    secure: true, // requires HTTPS (Vercel serves HTTPS; on plain http://localhost some browsers still accept this in dev)
+    secure: true,
     sameSite: "lax",
     maxAge: ttl,
     path: "/",
   });
 }
 
-function getSessionUser(req) {
+async function getSessionUser(req) {
   const sessionId = req.cookies && req.cookies[SESSION_COOKIE_NAME];
   if (!sessionId) return null;
-  const session = sessions.get(sessionId);
+  const session = await store.getSession(sessionId);
   if (!session) return null;
   if (Date.now() > session.expiresAt) {
-    sessions.delete(sessionId);
+    await store.deleteSession(sessionId);
     return null;
   }
-  return users.get(session.userId) || null;
+  return (await store.getUser(session.userId)) || null;
 }
 
-function requireSession(req, res, next) {
-  const user = getSessionUser(req);
+async function requireSession(req, res, next) {
+  const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ success: false, error: "Not authenticated." });
   req.sessionUser = user;
   next();
 }
 
-function requireJwt(req, res, next) {
+async function requireJwt(req, res, next) {
   const authHeader = req.headers.authorization || "";
   const [scheme, token] = authHeader.split(" ");
   if (scheme !== "Bearer" || !token) {
@@ -526,7 +600,7 @@ function requireJwt(req, res, next) {
   }
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = users.get(payload.sub);
+    const user = await store.getUser(payload.sub);
     if (!user) return res.status(401).json({ success: false, error: "Invalid token." });
     req.jwtUser = user;
     next();
@@ -538,7 +612,7 @@ function requireJwt(req, res, next) {
 // ---------------------------------------------------------------------------
 // POST /api/login — Step 1: validate credentials, report MFA requirement
 // ---------------------------------------------------------------------------
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { email, password } = req.body || {};
 
   if (!isValidEmail(email) || !password) {
@@ -546,11 +620,9 @@ app.post("/api/login", (req, res) => {
   }
 
   const normalizedEmail = email.trim().toLowerCase();
-  const userId = usersByEmail.get(normalizedEmail);
-  const user = userId ? users.get(userId) : null;
+  const userId = await store.getUserIdByEmail(normalizedEmail);
+  const user = userId ? await store.getUser(userId) : null;
 
-  // Deliberately use the same generic error for "no such user" and "wrong
-  // password" so login can't be used to enumerate registered emails.
   const genericError = "Invalid email or password. Please try again.";
 
   if (!user) {
@@ -572,23 +644,23 @@ app.post("/api/login", (req, res) => {
     if (user.failedLoginAttempts >= MAX_FAILED_LOGINS) {
       user.lockUntil = Date.now() + LOGIN_LOCKOUT_MINUTES * 60 * 1000;
       user.failedLoginAttempts = 0;
+      await store.setUser(user);
       return res.status(423).json({
         success: false,
         error: `Too many failed attempts. Account locked for ${LOGIN_LOCKOUT_MINUTES} minutes.`,
         lockedUntil: user.lockUntil,
       });
     }
+    await store.setUser(user);
     return res.status(401).json({ success: false, error: genericError });
   }
 
-  // Credentials valid — reset the failed-attempt counter.
   user.failedLoginAttempts = 0;
   user.lockUntil = null;
+  await store.setUser(user);
 
   if (!user.mfaEnabled) {
-    // Shouldn't normally happen since registration always enables MFA, but
-    // handle it defensively rather than assuming.
-    const { sessionId, ttl } = createSession(user.id, false);
+    const { sessionId, ttl } = await createSession(user.id, false);
     setSessionCookie(res, sessionId, ttl);
     return res.json({ success: true, mfaRequired: false, user: publicUserView(user) });
   }
@@ -610,7 +682,7 @@ app.post("/api/login", (req, res) => {
 // ---------------------------------------------------------------------------
 app.post("/api/login/select-method", async (req, res) => {
   const { userId, method } = req.body || {};
-  const user = users.get(userId);
+  const user = await store.getUser(userId);
 
   if (!user) return res.status(404).json({ success: false, error: "User not found." });
   if (!["email", "sms", "authenticator"].includes(method)) {
@@ -621,12 +693,11 @@ app.post("/api/login/select-method", async (req, res) => {
   }
 
   if (method === "authenticator") {
-    // No OTP to send — the frontend just shows a code-entry screen.
     return res.json({ mfaRequired: true, method: "authenticator", userId: user.id });
   }
 
   const destination = method === "sms" ? user.mobile : user.email;
-  const { challenge } = createChallenge({ userId: user.id, channel: method, destination });
+  const { challenge } = await createChallenge({ userId: user.id, channel: method, destination });
 
   return res.json({
     mfaRequired: true,
@@ -639,13 +710,13 @@ app.post("/api/login/select-method", async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/verify-login-otp — Step 3: verify code, create the session
 // ---------------------------------------------------------------------------
-app.post("/api/verify-login-otp", (req, res) => {
+app.post("/api/verify-login-otp", async (req, res) => {
   const { userId, method, code, challengeId, rememberMe } = req.body || {};
-  const user = users.get(userId);
+  const user = await store.getUser(userId);
   if (!user) return res.status(404).json({ success: false, error: "User not found." });
 
-  const finalizeLogin = () => {
-    const { sessionId, ttl } = createSession(user.id, !!rememberMe);
+  const finalizeLogin = async () => {
+    const { sessionId, ttl } = await createSession(user.id, !!rememberMe);
     setSessionCookie(res, sessionId, ttl);
     return res.json({ success: true, user: publicUserView(user) });
   };
@@ -679,9 +750,9 @@ app.get("/api/me", requireSession, (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/logout — invalidate the server-side session
 // ---------------------------------------------------------------------------
-app.post("/api/logout", (req, res) => {
+app.post("/api/logout", async (req, res) => {
   const sessionId = req.cookies && req.cookies[SESSION_COOKIE_NAME];
-  if (sessionId) sessions.delete(sessionId);
+  if (sessionId) await store.deleteSession(sessionId);
   res.clearCookie(SESSION_COOKIE_NAME, { path: "/" });
   res.json({ success: true });
 });
@@ -689,15 +760,15 @@ app.post("/api/logout", (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/token — issue a short-lived JWT (separate, stateless auth flow)
 // ---------------------------------------------------------------------------
-app.post("/api/token", (req, res) => {
+app.post("/api/token", async (req, res) => {
   const { email, password } = req.body || {};
   if (!isValidEmail(email) || !password) {
     return res.status(400).json({ success: false, error: "Enter a valid email and password." });
   }
 
   const normalizedEmail = email.trim().toLowerCase();
-  const userId = usersByEmail.get(normalizedEmail);
-  const user = userId ? users.get(userId) : null;
+  const userId = await store.getUserIdByEmail(normalizedEmail);
+  const user = userId ? await store.getUser(userId) : null;
 
   if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
     return res.status(401).json({ success: false, error: "Invalid email or password." });
@@ -720,17 +791,12 @@ app.get("/api/protected", requireJwt, (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Evaluator-only test endpoint: retrieve the *current* OTP for a challenge.
-// NEVER do this in a real product — included here only because the
-// assignment explicitly asks for a test-only mechanism to fetch simulated OTPs.
 // ---------------------------------------------------------------------------
-app.get("/api/test/otp/:challengeId", (req, res) => {
-  const challenge = challenges.get(req.params.challengeId);
+app.get("/api/test/otp/:challengeId", async (req, res) => {
+  const challenge = await store.getChallenge(req.params.challengeId);
   if (!challenge) return res.status(404).json({ success: false, error: "Challenge not found." });
 
-  // We only store a hash, so regenerate a fresh OTP for the evaluator and
-  // reset the challenge to match it (keeps this test-only path honest about
-  // "never return the real stored OTP" while still being useful to grade).
-  const otp = regenerateOtp(challenge);
+  const otp = await regenerateOtp(challenge);
   return res.json({
     success: true,
     challengeId: challenge.challengeId,
@@ -740,8 +806,8 @@ app.get("/api/test/otp/:challengeId", (req, res) => {
   });
 });
 
-// Health check
-app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+// Health check — also reports which storage backend is active, handy for debugging on Vercel.
+app.get("/api/health", (req, res) => res.json({ status: "ok", storage: useKv ? "vercel-kv" : "in-memory" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

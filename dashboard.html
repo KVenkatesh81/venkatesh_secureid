@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SecureID — Dashboard</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<div class="app-shell" style="max-width: 480px;">
+  <div class="brand">🔐 SecureID</div>
+
+  <div class="card dashboard-card" id="loadingCard">
+    <p class="subtitle" style="text-align:center;">Checking your session…</p>
+  </div>
+
+  <div class="card dashboard-card hidden" id="dashboardCard">
+    <div class="icon-circle green">✅</div>
+    <h1>Welcome back<span id="welcomeName"></span></h1>
+    <p class="subtitle">You're logged in via a secure, server-side session.</p>
+
+    <div class="kv-row"><span>Email</span><span id="infoEmail"></span></div>
+    <div class="kv-row"><span>Mobile</span><span id="infoMobile"></span></div>
+    <div class="kv-row"><span>MFA method</span><span id="infoMfa"></span></div>
+    <div class="kv-row"><span>Session</span><span class="badge">Active (HttpOnly cookie)</span></div>
+
+    <button class="btn" id="logoutBtn" style="margin-top:20px;">Logout</button>
+
+    <div class="divider">JWT auth demo (separate from the session above)</div>
+
+    <p class="subtitle" style="margin-bottom:10px;">Re-enter your password to issue a short-lived JWT and call a protected API with it.</p>
+    <input type="password" id="jwtPassword" placeholder="Password" style="margin-bottom:10px;" />
+    <button class="btn secondary" id="getTokenBtn">Get JWT &amp; call /api/protected</button>
+
+    <div id="jwtResult" class="hidden">
+      <p class="foot-note" style="margin-top:14px; margin-bottom:4px; text-align:left;">Issued JWT (kept in memory only — never localStorage):</p>
+      <div class="jwt-output" id="jwtToken"></div>
+      <p class="foot-note" style="margin-top:14px; margin-bottom:4px; text-align:left;">Response from GET /api/protected:</p>
+      <div class="jwt-output" id="protectedResponse"></div>
+    </div>
+  </div>
+
+  <div class="card dashboard-card hidden" id="notLoggedInCard">
+    <div class="icon-circle red">🔒</div>
+    <h1>Not logged in</h1>
+    <p class="subtitle">Your session has expired or you haven't logged in yet.</p>
+    <button class="btn" id="goToLoginBtn">Go to Login</button>
+  </div>
+
+</div>
+
+<script src="js/dashboard.js"></script>
+</body>
+</html>

@@ -82,3 +82,17 @@ Returns `{ success, challengeId, channel, otp, expiresAt }`. **Test-only** — r
 **Important:** set a real `JWT_SECRET` environment variable in Vercel (Project → Settings → Environment Variables) before relying on the JWT flow for anything beyond a demo — the code falls back to a dev-only secret otherwise.
 
 **Known limitation:** this uses in-memory storage (`Map`s) for users, OTP challenges, and sessions, so the whole journey depends on server state surviving between requests. Vercel serverless functions can spin up a fresh, empty instance after idle periods — fine for back-to-back testing, but a long-idle demo may "forget" a session or challenge mid-flow. For a fully robust graded deployment, swap the `Map`s for a real store (Vercel KV / Redis / a small DB) — happy to wire that up if useful.
+
+## Fixing the "just registered, but login says invalid credentials" issue on Vercel
+
+This happens because Vercel serverless functions don't share memory between requests — a plain in-memory store can be empty again by the very next request. The fix: connect a persistent Redis store to your project (a few clicks, no code changes needed).
+
+1. In your Vercel project dashboard, go to the **Storage** tab (or **Marketplace** → search "Redis").
+2. Install **Upstash for Redis** and create a database (the free tier is enough for this).
+3. Connect it to this project — Vercel will automatically inject `KV_REST_API_URL` and `KV_REST_API_TOKEN` as environment variables.
+4. Redeploy (Vercel usually does this automatically after connecting storage; if not, push any small commit or hit "Redeploy" in the dashboard).
+5. Check `https://your-app.vercel.app/api/health` — it should now report `"storage":"vercel-kv"` instead of `"storage":"in-memory"`.
+
+Once that's connected, registered accounts will persist properly and login will work as expected — no matter which serverless instance handles the request.
+
+Running locally with `npm start` never needs this — it automatically uses in-memory storage when no Redis env vars are present.
