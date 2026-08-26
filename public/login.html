@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SecureID — Login</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<div class="app-shell">
+  <div class="brand">🔐 SecureID</div>
+
+  <div class="card">
+
+    <!-- STEP 1: Login form -->
+    <section id="step-login">
+      <div class="icon-circle blue">🔒</div>
+      <h1>Welcome back!</h1>
+      <p class="subtitle">Login to your account</p>
+
+      <form id="loginForm" novalidate>
+        <label for="loginEmail">Email or Username</label>
+        <input type="email" id="loginEmail" placeholder="priya.sharma@email.com" autocomplete="username" />
+        <div class="field-error" id="err-loginEmail"></div>
+
+        <label for="loginPassword">Password</label>
+        <div class="input-wrap">
+          <input type="password" id="loginPassword" placeholder="••••••••••" autocomplete="current-password" />
+          <button type="button" class="toggle-visibility" id="toggleLoginPw">👁</button>
+        </div>
+        <div class="field-error" id="err-loginPassword"></div>
+        <div class="field-error" id="err-loginGeneral"></div>
+
+        <div class="row-between">
+          <label><input type="checkbox" id="rememberMe" /> Remember me</label>
+          <a href="#" id="forgotPasswordLink">Forgot password?</a>
+        </div>
+
+        <button type="submit" class="btn" id="loginBtn">Login</button>
+      </form>
+
+      <div class="divider">or</div>
+      <button class="btn-google" id="googleBtn">🔵 Continue with Google</button>
+
+      <p class="foot-note">New here? <a href="/register.html">Create an account</a></p>
+    </section>
+
+    <!-- STEP 3: Choose MFA method -->
+    <section id="step-choose-method" class="hidden">
+      <div class="icon-circle blue">🛡️</div>
+      <h1>Verify your identity</h1>
+      <p class="subtitle">Choose a method to continue</p>
+
+      <div class="mfa-options" id="loginMfaOptions"></div>
+
+      <button class="btn" id="chooseMethodContinueBtn">Continue</button>
+    </section>
+
+    <!-- STEP 4/5/6: OTP / TOTP verification (shared for email, sms, authenticator) -->
+    <section id="step-login-otp" class="hidden">
+      <button class="step-back" data-back="step-choose-method">←</button>
+      <div class="icon-circle blue" id="loginOtpIcon">✉️</div>
+      <h1 id="loginOtpTitle">Email Verification</h1>
+      <p class="subtitle" id="loginOtpSubtitle">Enter the 6-digit code sent to</p>
+      <p class="destination" id="loginOtpDestination"></p>
+
+      <div class="otp-boxes" id="loginOtpBoxes"></div>
+      <div class="otp-status" id="loginOtpStatus"></div>
+      <div class="timer-row" id="loginOtpTimerRow">Code expires in <span class="time" id="loginOtpTimer">02:45</span></div>
+
+      <button class="btn" id="verifyLoginOtpBtn">Verify</button>
+
+      <p class="center-link">
+        <button class="link-btn" id="resendLoginOtpBtn" disabled>Resend code (<span id="loginOtpResendTimer">25</span>)</button>
+      </p>
+    </section>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/login.js"></script>
+</body>
+</html>

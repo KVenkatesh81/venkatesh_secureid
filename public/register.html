@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SecureID — Create your account</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<div class="app-shell">
+  <div class="brand">🔐 SecureID</div>
+
+  <div class="card">
+
+    <!-- STEP 1: Registration form -->
+    <section id="step-details">
+      <h1>Create your account</h1>
+      <p class="subtitle">Let's get you started</p>
+
+      <form id="registerForm" novalidate>
+        <label for="fullName">Full Name</label>
+        <input type="text" id="fullName" placeholder="Priya Sharma" autocomplete="name" />
+        <div class="field-error" id="err-fullName"></div>
+
+        <label for="email">Email</label>
+        <input type="email" id="email" placeholder="priya.sharma@email.com" autocomplete="email" />
+        <div class="field-error" id="err-email"></div>
+
+        <label for="mobile">Mobile Number</label>
+        <div class="phone-row">
+          <select id="countryCode">
+            <option value="+91" selected>+91</option>
+            <option value="+1">+1</option>
+            <option value="+44">+44</option>
+          </select>
+          <input type="tel" id="mobile" placeholder="98765 43210" autocomplete="tel-national" />
+        </div>
+        <div class="field-error" id="err-mobile"></div>
+
+        <label for="password">Password</label>
+        <div class="input-wrap">
+          <input type="password" id="password" placeholder="••••••••••••" autocomplete="new-password" />
+          <button type="button" class="toggle-visibility" id="togglePw">👁</button>
+        </div>
+        <ul class="pw-rules" id="pwRules">
+          <li class="rule" data-rule="len"><span class="dot">✓</span> At least 8 characters</li>
+          <li class="rule" data-rule="upper"><span class="dot">✓</span> 1 uppercase letter</li>
+          <li class="rule" data-rule="num"><span class="dot">✓</span> 1 number</li>
+          <li class="rule" data-rule="special"><span class="dot">✓</span> 1 special character</li>
+        </ul>
+        <div class="field-error" id="err-password"></div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="agreeToTerms" />
+          <span>I agree to the Terms &amp; Conditions and Privacy Policy</span>
+        </label>
+        <div class="field-error" id="err-agreeToTerms"></div>
+
+        <button type="submit" class="btn" id="createAccountBtn">Create Account</button>
+      </form>
+
+      <p class="foot-note">Already have an account? <a href="/login.html">Login</a></p>
+    </section>
+
+    <!-- STEP 2: Email OTP -->
+    <section id="step-email-otp" class="hidden">
+      <button class="step-back" data-back="step-details">←</button>
+      <div class="icon-circle blue">✉️</div>
+      <h1>Verify your email</h1>
+      <p class="subtitle">We have sent a 6-digit code to</p>
+      <p class="destination" id="emailDestination"></p>
+
+      <div class="otp-boxes" id="emailOtpBoxes"></div>
+      <div class="otp-status" id="emailOtpStatus"></div>
+      <div class="timer-row" id="emailTimerRow">Code expires in <span class="time" id="emailTimer">02:45</span></div>
+
+      <button class="btn" id="verifyEmailBtn">Verify</button>
+
+      <p class="center-link">
+        <button class="link-btn" id="resendEmailBtn" disabled>Resend code (<span id="emailResendTimer">25</span>)</button>
+      </p>
+    </section>
+
+    <!-- STEP 3: SMS OTP -->
+    <section id="step-sms-otp" class="hidden">
+      <button class="step-back" data-back="step-email-otp">←</button>
+      <div class="icon-circle green">📱</div>
+      <h1>Verify your mobile</h1>
+      <p class="subtitle">We have sent a 6-digit code to</p>
+      <p class="destination" id="smsDestination"></p>
+
+      <div class="otp-boxes" id="smsOtpBoxes"></div>
+      <div class="otp-status" id="smsOtpStatus"></div>
+      <div class="timer-row" id="smsTimerRow">Code expires in <span class="time" id="smsTimer">02:45</span></div>
+
+      <button class="btn" id="verifySmsBtn">Verify</button>
+
+      <p class="center-link">
+        <button class="link-btn" id="resendSmsBtn" disabled>Resend code (<span id="smsResendTimer">25</span>)</button>
+      </p>
+    </section>
+
+    <!-- STEP 3-max-attempts -->
+    <section id="step-sms-locked" class="hidden">
+      <div class="icon-circle red">📱</div>
+      <h1>Verify your mobile</h1>
+      <p class="subtitle">We have sent a 6-digit code to</p>
+      <p class="destination" id="smsLockedDestination"></p>
+      <div class="field-error show" style="text-align:center;font-weight:600;">Maximum attempts reached. Please request a new code.</div>
+      <button class="btn" id="smsLockedResendBtn">Resend New Code</button>
+    </section>
+
+    <!-- STEP 4: Set up MFA -->
+    <section id="step-mfa-setup" class="hidden">
+      <div class="icon-circle blue">🛡️</div>
+      <h1>Set up Multi-Factor Auth</h1>
+      <p class="subtitle">Add an extra layer of security to protect your account.</p>
+
+      <div class="mfa-options" id="mfaOptions">
+        <label class="mfa-option selected" data-method="authenticator">
+          <span class="mfa-icon">🔑</span>
+          <span class="mfa-text"><strong>Authenticator App</strong><span>Google Authenticator / Authy</span></span>
+          <input type="radio" name="mfaMethod" value="authenticator" checked />
+        </label>
+        <label class="mfa-option" data-method="sms">
+          <span class="mfa-icon">💬</span>
+          <span class="mfa-text"><strong>SMS Authentication</strong><span>Receive codes on your mobile</span></span>
+          <input type="radio" name="mfaMethod" value="sms" />
+        </label>
+        <label class="mfa-option" data-method="email">
+          <span class="mfa-icon">✉️</span>
+          <span class="mfa-text"><strong>Email Authentication</strong><span>Receive codes on your email</span></span>
+          <input type="radio" name="mfaMethod" value="email" />
+        </label>
+      </div>
+
+      <button class="btn" id="mfaContinueBtn">Continue</button>
+    </section>
+
+    <!-- STEP 5: Authenticator QR setup -->
+    <section id="step-authenticator-setup" class="hidden">
+      <button class="step-back" data-back="step-mfa-setup">←</button>
+      <h1>Scan QR Code</h1>
+      <p class="subtitle">Open your authenticator app and scan this QR code</p>
+
+      <div class="qr-wrap"><img id="qrImage" src="" alt="MFA QR code" /></div>
+      <p class="copy-key">Can't scan? <button class="link-btn" id="showManualKeyBtn">Enter setup key</button></p>
+      <p class="copy-key hidden" id="manualKeyRow">Setup key: <code id="manualKey"></code></p>
+
+      <button class="btn" id="authenticatorContinueBtn">Continue</button>
+    </section>
+
+    <!-- STEP 6: MFA verification -->
+    <section id="step-mfa-verify" class="hidden">
+      <button class="step-back" id="mfaVerifyBack">←</button>
+      <div class="icon-circle blue">🛡️</div>
+      <h1>Enter the 6-digit code</h1>
+      <p class="subtitle" id="mfaVerifySubtitle">Enter the code from your authenticator app</p>
+
+      <div class="otp-boxes" id="mfaOtpBoxes"></div>
+      <div class="otp-status" id="mfaOtpStatus"></div>
+      <div class="timer-row hidden" id="mfaTimerRow">Code expires in <span class="time" id="mfaTimer">02:45</span></div>
+
+      <button class="btn" id="verifyMfaBtn">Verify</button>
+      <p class="center-link" id="mfaAccessHelp">Can't access your app?</p>
+    </section>
+
+    <!-- STEP 7: Success -->
+    <section id="step-success" class="hidden">
+      <div class="icon-circle green">✅</div>
+      <h1>Account created!</h1>
+      <p class="subtitle">Your account has been created successfully and MFA is enabled.</p>
+
+      <ul class="success-list">
+        <li><span class="check">✔</span> Email verified</li>
+        <li><span class="check">✔</span> Mobile verified</li>
+        <li><span class="check">✔</span> MFA enabled</li>
+      </ul>
+
+      <button class="btn" id="continueToLoginBtn">Continue to Login</button>
+    </section>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/register.js"></script>
+</body>
+</html>
