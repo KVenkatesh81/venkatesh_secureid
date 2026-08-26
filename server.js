@@ -1,14 +1,20 @@
 /**
- * SecureID — Part 1: Registration Journey
+ * SecureID — Registration + Login Journeys
  * ------------------------------------------------------------
- * Flow implemented (matches the provided screens):
+ * Part 1 (Registration):
  *   Register (details) -> Email OTP -> SMS OTP -> Set up MFA
  *   -> Authenticator QR setup -> MFA verification -> Registration Success
+ *
+ * Part 2 (Login):
+ *   Login (credentials) -> Choose MFA method -> OTP/TOTP verification
+ *   -> Session cookie created (session auth) + separate JWT auth flow
  *
  * Everything security-sensitive happens on the server:
  *   - password hashing (bcrypt)
  *   - OTP generation, hashing, expiry, attempt limiting
  *   - TOTP secret generation + verification (speakeasy)
+ *   - session cookies are HttpOnly + Secure + SameSite, never in localStorage
+ *   - JWTs are short-lived and verified server-side on every protected call
  *
  * Storage is in-memory (Maps) for assignment/demo purposes.
  * Swap `db.js`-style module for a real DB in production.
@@ -19,12 +25,15 @@ const path = require("path");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
+const jwt = require("jsonwebtoken");
 const speakeasy = require("speakeasy");
 const QRCode = require("qrcode");
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
 
 // ---------------------------------------------------------------------------
@@ -33,6 +42,7 @@ app.use(express.static(path.join(__dirname, "public")));
 const users = new Map(); // userId -> user object
 const usersByEmail = new Map(); // email(lowercase) -> userId
 const challenges = new Map(); // challengeId -> challenge object
+const sessions = new Map(); // sessionId -> session object
 
 // ---------------------------------------------------------------------------
 // Config
@@ -41,6 +51,17 @@ const OTP_LENGTH = 6;
 const OTP_EXPIRY_SECONDS = 165; // 02:45 shown in the mock screens
 const OTP_RESEND_COOLDOWN_SECONDS = 25; // 00:25 resend cooldown
 const OTP_MAX_ATTEMPTS = 3; // "You have 2 attempts left" after 1st wrong try
+
+const MAX_FAILED_LOGINS = 5;
+const LOGIN_LOCKOUT_MINUTES = 15;
+
+const SESSION_COOKIE_NAME = "sid";
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours (normal login)
+const SESSION_TTL_REMEMBER_MS = 30 * 24 * 60 * 60 * 1000; // 30 days ("Remember me")
+
+// In production, set JWT_SECRET as a real env var (Vercel → Project → Settings → Environment Variables).
+const JWT_SECRET = process.env.JWT_SECRET || "dev-only-secret-change-me";
+const JWT_EXPIRES_IN = "15m";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -453,6 +474,250 @@ app.post("/api/mfa/verify", (req, res) => {
   );
 });
 
+// =============================================================================
+// PART 2 — LOGIN JOURNEY
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+function createSession(userId, rememberMe) {
+  const sessionId = newId("sess");
+  const now = Date.now();
+  const ttl = rememberMe ? SESSION_TTL_REMEMBER_MS : SESSION_TTL_MS;
+  sessions.set(sessionId, { sessionId, userId, createdAt: now, expiresAt: now + ttl });
+  return { sessionId, ttl };
+}
+
+function setSessionCookie(res, sessionId, ttl) {
+  res.cookie(SESSION_COOKIE_NAME, sessionId, {
+    httpOnly: true,
+    secure: true, // requires HTTPS (Vercel serves HTTPS; on plain http://localhost some browsers still accept this in dev)
+    sameSite: "lax",
+    maxAge: ttl,
+    path: "/",
+  });
+}
+
+function getSessionUser(req) {
+  const sessionId = req.cookies && req.cookies[SESSION_COOKIE_NAME];
+  if (!sessionId) return null;
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+  if (Date.now() > session.expiresAt) {
+    sessions.delete(sessionId);
+    return null;
+  }
+  return users.get(session.userId) || null;
+}
+
+function requireSession(req, res, next) {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ success: false, error: "Not authenticated." });
+  req.sessionUser = user;
+  next();
+}
+
+function requireJwt(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const [scheme, token] = authHeader.split(" ");
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ success: false, error: "Missing or malformed Authorization header." });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = users.get(payload.sub);
+    if (!user) return res.status(401).json({ success: false, error: "Invalid token." });
+    req.jwtUser = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: "Invalid or expired token." });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/login — Step 1: validate credentials, report MFA requirement
+// ---------------------------------------------------------------------------
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body || {};
+
+  if (!isValidEmail(email) || !password) {
+    return res.status(400).json({ success: false, error: "Enter a valid email/username and password." });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const userId = usersByEmail.get(normalizedEmail);
+  const user = userId ? users.get(userId) : null;
+
+  // Deliberately use the same generic error for "no such user" and "wrong
+  // password" so login can't be used to enumerate registered emails.
+  const genericError = "Invalid email or password. Please try again.";
+
+  if (!user) {
+    return res.status(401).json({ success: false, error: genericError });
+  }
+
+  if (user.lockUntil && Date.now() < user.lockUntil) {
+    const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
+    return res.status(423).json({
+      success: false,
+      error: `Too many failed attempts. Account temporarily locked. Try again in ${minutesLeft} minute(s).`,
+      lockedUntil: user.lockUntil,
+    });
+  }
+
+  const passwordOk = bcrypt.compareSync(password, user.passwordHash);
+  if (!passwordOk) {
+    user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+    if (user.failedLoginAttempts >= MAX_FAILED_LOGINS) {
+      user.lockUntil = Date.now() + LOGIN_LOCKOUT_MINUTES * 60 * 1000;
+      user.failedLoginAttempts = 0;
+      return res.status(423).json({
+        success: false,
+        error: `Too many failed attempts. Account locked for ${LOGIN_LOCKOUT_MINUTES} minutes.`,
+        lockedUntil: user.lockUntil,
+      });
+    }
+    return res.status(401).json({ success: false, error: genericError });
+  }
+
+  // Credentials valid — reset the failed-attempt counter.
+  user.failedLoginAttempts = 0;
+  user.lockUntil = null;
+
+  if (!user.mfaEnabled) {
+    // Shouldn't normally happen since registration always enables MFA, but
+    // handle it defensively rather than assuming.
+    const { sessionId, ttl } = createSession(user.id, false);
+    setSessionCookie(res, sessionId, ttl);
+    return res.json({ success: true, mfaRequired: false, user: publicUserView(user) });
+  }
+
+  const availableMethods = ["email", "sms"];
+  if (user.mfaSecret) availableMethods.push("authenticator");
+
+  return res.json({
+    success: true,
+    mfaRequired: true,
+    userId: user.id,
+    availableMethods,
+    defaultMethod: user.mfaMethod && availableMethods.includes(user.mfaMethod) ? user.mfaMethod : availableMethods[0],
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/login/select-method — Step 2: user picks how to receive the code
+// ---------------------------------------------------------------------------
+app.post("/api/login/select-method", async (req, res) => {
+  const { userId, method } = req.body || {};
+  const user = users.get(userId);
+
+  if (!user) return res.status(404).json({ success: false, error: "User not found." });
+  if (!["email", "sms", "authenticator"].includes(method)) {
+    return res.status(400).json({ success: false, error: "Invalid method." });
+  }
+  if (method === "authenticator" && !user.mfaSecret) {
+    return res.status(400).json({ success: false, error: "Authenticator app is not set up for this account." });
+  }
+
+  if (method === "authenticator") {
+    // No OTP to send — the frontend just shows a code-entry screen.
+    return res.json({ mfaRequired: true, method: "authenticator", userId: user.id });
+  }
+
+  const destination = method === "sms" ? user.mobile : user.email;
+  const { challenge } = createChallenge({ userId: user.id, channel: method, destination });
+
+  return res.json({
+    mfaRequired: true,
+    method,
+    userId: user.id,
+    challenge: publicChallengeView(challenge),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/verify-login-otp — Step 3: verify code, create the session
+// ---------------------------------------------------------------------------
+app.post("/api/verify-login-otp", (req, res) => {
+  const { userId, method, code, challengeId, rememberMe } = req.body || {};
+  const user = users.get(userId);
+  if (!user) return res.status(404).json({ success: false, error: "User not found." });
+
+  const finalizeLogin = () => {
+    const { sessionId, ttl } = createSession(user.id, !!rememberMe);
+    setSessionCookie(res, sessionId, ttl);
+    return res.json({ success: true, user: publicUserView(user) });
+  };
+
+  if (method === "authenticator") {
+    if (!user.mfaSecret) {
+      return res.status(400).json({ success: false, error: "Authenticator app is not set up for this account." });
+    }
+    const verified = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: "base32",
+      token: (code || "").trim(),
+      window: 1,
+    });
+    if (!verified) {
+      return res.status(400).json({ success: false, error: "Invalid code. Please try again." });
+    }
+    return finalizeLogin();
+  }
+
+  return verifyOtpChallenge({ body: { challengeId, otp: code } }, res, method, () => finalizeLogin());
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/me — current authenticated user (session-cookie based)
+// ---------------------------------------------------------------------------
+app.get("/api/me", requireSession, (req, res) => {
+  res.json({ success: true, user: publicUserView(req.sessionUser) });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/logout — invalidate the server-side session
+// ---------------------------------------------------------------------------
+app.post("/api/logout", (req, res) => {
+  const sessionId = req.cookies && req.cookies[SESSION_COOKIE_NAME];
+  if (sessionId) sessions.delete(sessionId);
+  res.clearCookie(SESSION_COOKIE_NAME, { path: "/" });
+  res.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/token — issue a short-lived JWT (separate, stateless auth flow)
+// ---------------------------------------------------------------------------
+app.post("/api/token", (req, res) => {
+  const { email, password } = req.body || {};
+  if (!isValidEmail(email) || !password) {
+    return res.status(400).json({ success: false, error: "Enter a valid email and password." });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const userId = usersByEmail.get(normalizedEmail);
+  const user = userId ? users.get(userId) : null;
+
+  if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
+    return res.status(401).json({ success: false, error: "Invalid email or password." });
+  }
+
+  const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+  return res.json({ success: true, token, tokenType: "Bearer", expiresIn: JWT_EXPIRES_IN });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/protected — demonstrates server-side JWT verification
+// ---------------------------------------------------------------------------
+app.get("/api/protected", requireJwt, (req, res) => {
+  res.json({
+    success: true,
+    message: "This data is only reachable with a valid, unexpired JWT.",
+    user: publicUserView(req.jwtUser),
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Evaluator-only test endpoint: retrieve the *current* OTP for a challenge.
 // NEVER do this in a real product — included here only because the
@@ -480,7 +745,7 @@ app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\nSecureID (Part 1 — Registration) running on http://localhost:${PORT}\n`);
+  console.log(`\nSecureID (Registration + Login) running on http://localhost:${PORT}\n`);
 });
 
 module.exports = app;
